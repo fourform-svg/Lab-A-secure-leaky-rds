@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lab A - Operation Lockdown - Independent - Secure Aurora PostgreSQL with KMS CMK, Private Subnets, RDS Proxy IAM Auth, Secrets Manager
+
+Parameters:
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: !Ref VpcCidr, Tags: [{Key: Name, Value: lab-a-vpc}]}
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.0.2.0/24, AvailabilityZone: !Select [0, !GetAZs '']}
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.0.3.0/24, AvailabilityZone: !Select [1, !GetAZs '']}
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: {DBSubnetGroupDescription: lab-a private, SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]}
+  
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Lab A CMK for RDS and Secrets
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow, Principal: {AWS: !Sub arn:aws:iam::${AWS::AccountId}:root}, Action: 'kms:*', Resource: '*'
+  KMSAlias:
+    Type: AWS::KMS::Alias
+    Properties: {AliasName: alias/rds/lab-a-secure, TargetKeyId: !Ref KMSKey}
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: lab-a/rds/credentials
+      KmsKeyId: !Ref KMSKey
+      SecretString: !Sub '{"username":"dbadmin","password":"${DBMasterPassword}"}'
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lab A DB SG - only proxy
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref ProxySecurityGroup
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lab A Proxy SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: 10.0.0.0/16
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '15.4'
+      MasterUsername: dbadmin
+      MasterUserPassword: !Ref DBMasterPassword
+      DatabaseName: labadb
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref DBSecurityGroup]
+      StorageEncrypted: true
+      KmsKeyId: !Ref KMSKey
+      DeletionProtection: false
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref KMSKey
+
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: rds.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: proxy-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref DBSecret
+              - Effect: Allow, Action: kms:Decrypt, Resource: !GetAtt KMSKey.Arn
+
+  DBProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: lab-a-proxy
+      EngineFamily: POSTGRESQL
+      RoleArn: !GetAtt ProxyRole.Arn
+      VpcSubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      VpcSecurityGroupIds: [!Ref ProxySecurityGroup]
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DBSecret
+          IAMAuth: REQUIRED
+
+Outputs:
+  ProxyEndpoint:
+    Value: !GetAtt DBProxy.Endpoint
+  ClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint
+  KMSKeyId:
+    Value: !Ref KMSKey
